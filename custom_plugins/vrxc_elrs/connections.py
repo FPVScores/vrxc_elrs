@@ -14,6 +14,12 @@ from .msp import MSPPacket, MSPPacketType, MSPTypes
 
 SOCKET_PORT = 8080
 AVOIDED_PORTS = {"/dev/ttyAMA0", "/dev/ttyAMA10", "COM1"}
+_SOCKET_CLOSED = (
+    ConnectionError,
+    BrokenPipeError,
+    TimeoutError,
+    OSError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,8 +154,11 @@ class SerialConnection:
         """
         Parses incoming data
         """
-        for packet in MSPPacket.packets_from_bytes_queue(self._parsing_queue):
-            self._recieve_queue.put(packet)
+        try:
+            for packet in MSPPacket.packets_from_bytes_queue(self._parsing_queue):
+                self._recieve_queue.put(packet)
+        except Exception:
+            logger.exception("Failed to parse backpack packet")
 
     def _recieve(self) -> None:
         """
@@ -254,8 +263,8 @@ class SocketConnection:
                     self._socket.sendall(packet.get_packet())
                 finally:
                     timeout.close()
-        except gevent._socketcommon.cancel_wait_ex:
-            ...
+        except (gevent._socketcommon.cancel_wait_ex, gevent.Timeout, *_SOCKET_CLOSED) as exc:
+            logger.info("Backpack socket send closed (%s)", exc)
 
         finally:
             self._connected = False
@@ -269,10 +278,15 @@ class SocketConnection:
         try:
             while self._connected:
                 data = self._socket.recv(128)
-                for packet in MSPPacket.packets_from_bytes(data):
-                    self._recieve_queue.put(packet)
-        except gevent._socketcommon.cancel_wait_ex:
-            ...
+                if not data:
+                    break
+                try:
+                    for packet in MSPPacket.packets_from_bytes(data):
+                        self._recieve_queue.put(packet)
+                except Exception:
+                    logger.exception("Failed to parse backpack packet")
+        except (gevent._socketcommon.cancel_wait_ex, *_SOCKET_CLOSED) as exc:
+            logger.info("Backpack socket closed (%s)", exc)
 
         finally:
             self._connected = False

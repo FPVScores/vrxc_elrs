@@ -2,6 +2,7 @@
 ExpressLRS Backpack bridge
 """
 
+import logging
 import sys
 from collections.abc import Generator, Sequence
 from enum import Enum, IntEnum, auto
@@ -15,6 +16,7 @@ else:
     from typing_extensions import Self
 
 MSP_HEADER_LENGTH = 8
+logger = logging.getLogger(__name__)
 
 
 class MSPState(Enum):
@@ -86,6 +88,8 @@ class MSPTypes(IntEnum):
         0x030D  # enable/disable head-tracking forwarding packets to the TX
     )
     MSP_ELRS_BACKPACK_SET_RTC = 0x030E
+    MSP_ELRS_BACKPACK_CONFIG = 0x30
+    MSP_ELRS_BACKPACK_CONFIG_TLM_MODE = 0x31
 
     # incoming, packets originating from the VRx
     MSP_ELRS_BACKPACK_SET_MODE = 0x0380  # enable wifi/binding mode
@@ -185,7 +189,12 @@ class MSPPacket:
 
                 if len(buffer) == MSP_HEADER_LENGTH:
                     flags = buffer[3]
-                    function_ = MSPTypes(cls._bytes_to_int(buffer[4:6]))
+                    raw_fn = cls._bytes_to_int(buffer[4:6])
+                    try:
+                        function_ = MSPTypes(raw_fn)
+                    except ValueError:
+                        logger.debug("Ignoring unknown MSP function %s", raw_fn)
+                        function_ = None
                     length = cls._bytes_to_int(buffer[6:8])
 
                     if length == 0:
@@ -201,8 +210,7 @@ class MSPPacket:
                     state = MSPState.CHECKSUM_V2_NATIVE
 
             elif state == MSPState.CHECKSUM_V2_NATIVE:
-                if c == crc:
-                    assert function_ is not None
+                if c == crc and function_ is not None:
                     packet = cls()
                     packet.set_type(type_)
                     packet.set_flags(flags)

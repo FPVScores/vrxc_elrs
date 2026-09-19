@@ -11,6 +11,7 @@ from VRxControl import VRxController
 
 from .connections import BackpackConnection, ConnectionTypeEnum
 from .msp import MSPPacket, MSPPacketType, MSPTypes
+from .osd_layout import element, parse_comm_osd
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class ELRSBackpack(VRxController):
         self._send_queue = Queue()
         self._recieve_queue = Queue(maxsize=100)
         self._queue_lock = gevent.lock.RLock()
+        self._osd_layouts: dict[int, dict | None] = {}
 
     @property
     def _backpack_connected(self) -> bool:
@@ -250,6 +252,168 @@ class ELRSBackpack(VRxController):
         col = 50 // 2 - offset
         return max(col, 0)
 
+    def _pilot_on(self, pilot_id: int) -> bool:
+        return self._rhapi.db.pilot_attribute_value(pilot_id, "elrs_active") == "1"
+
+    def _active_pilot_ids(self) -> list[int]:
+        out = []
+        for seat, pilot_id in (self._rhapi.race.pilots or {}).items():
+            if pilot_id and self._pilot_on(pilot_id):
+                out.append(int(pilot_id))
+        return out
+
+    def _preload_layouts(self, pilot_ids=None) -> None:
+        for pilot_id in pilot_ids or self._active_pilot_ids():
+            self._pilot_layout(int(pilot_id))
+
+    def _pilot_layout(self, pilot_id: int) -> dict | None:
+        if pilot_id in self._osd_layouts:
+            return self._osd_layouts[pilot_id]
+        raw = None
+        try:
+            raw = self._rhapi.db.pilot_attribute_value(pilot_id, "comm_osd")
+        except Exception:
+            logger.exception("Failed to read comm_osd for pilot %s", pilot_id)
+        if not raw:
+            try:
+                for attr in self._rhapi.db.pilot_attributes(pilot_id) or []:
+                    name = getattr(attr, "name", "")
+                    if name in ("comm_osd", "goggle_osd"):
+                        value = getattr(attr, "value", None)
+                        if value:
+                            raw = value
+                            break
+            except Exception:
+                logger.exception("Failed to list OSD attributes for pilot %s", pilot_id)
+        layout = parse_comm_osd(raw)
+        self._osd_layouts[pilot_id] = layout
+        if layout:
+            status = element(layout, "race_status")
+            lap = element(layout, "lap_result")
+            heat = element(layout, "heat_name")
+            logger.info(
+                "Pilot %s using FPV Scores OSD layout heat_row=%s arm_row=%s lap_row=%s",
+                pilot_id,
+                None if heat is None else heat.get("row"),
+                None if status is None else status.get("row"),
+                None if lap is None else lap.get("row"),
+            )
+        else:
+            logger.info("Pilot %s using timer OSD settings", pilot_id)
+        return layout
+
+    def _item(
+        self,
+        layout: dict | None,
+        item_id: str,
+        *,
+        fallback_on: bool = True,
+        row: int = 0,
+        hold_secs: int | None = None,
+        num_laps: int = 3,
+    ) -> dict | None:
+        if layout is not None:
+            return element(layout, item_id)
+        if not fallback_on:
+            return None
+        return {
+            "enabled": True,
+            "row": max(0, min(17, int(row or 0))),
+            "col": 0,
+            "center": True,
+            "hold_secs": hold_secs,
+            "num_laps": max(1, min(5, int(num_laps or 3))),
+        }
+
+    def _coords(self, item: dict, text: str) -> tuple[int, int]:
+        row = max(0, min(17, int(item.get("row") or 0)))
+        if item.get("center", True):
+            return row, self.center_osd(len(text))
+        return row, max(0, min(49, int(item.get("col") or 0)))
+
+    def _hold_seconds(self, item: dict | None, decaseconds_option: str | None = None) -> float:
+        if item is None:
+            return -1
+        hold = item.get("hold_secs")
+        if hold is None:
+            if not decaseconds_option:
+                return -1
+            try:
+                return max(0, int(self._rhapi.db.option(decaseconds_option))) * 0.1
+            except (TypeError, ValueError):
+                return 5
+        try:
+            return float(int(hold))
+        except (TypeError, ValueError):
+            return 5
+
+    def _opt_int(self, name: str, default: int = 0) -> int:
+        try:
+            return int(self._rhapi.db.option(name))
+        except (TypeError, ValueError):
+            return default
+
+    def _short_time(self, value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (int, float)):
+            try:
+                value = self._rhapi.utils.format_split_time_to_str(value, "{m}:{s}.{d}")
+            except Exception:
+                value = str(value)
+        text = str(value).strip()
+        if text.startswith("0:"):
+            text = text[2:]
+        if "." in text:
+            whole, frac = text.split(".", 1)
+            text = whole + "." + frac[:2]
+        return text
+
+    def _send_item(self, item: dict | None, text: str, label: str = "") -> int | None:
+        if not item or not text:
+            return None
+        row, col = self._coords(item, text)
+        logger.info(
+            "OSD send %s row=%s col=%s %s",
+            label or "item",
+            row,
+            col,
+            text[:48],
+        )
+        self.send_osd_text(row, col, text)
+        return row
+
+    def _clear_rows(self, start_row: int, count: int = 1) -> None:
+        for row in range(start_row, min(start_row + max(1, count), 18)):
+            self.send_clear_osd_row(row)
+
+    def _show_then_clear(
+        self,
+        uid: bytes,
+        item: dict | None,
+        text: str,
+        decaseconds_option: str | None = None,
+        rows: int = 1,
+    ) -> None:
+        if not item or not text:
+            return
+        row, col = self._coords(item, text)
+        logger.info("OSD send row=%s col=%s %s", row, col, text[:48])
+        with self._queue_lock:
+            self.set_send_uid(uid)
+            self.send_osd_text(row, col, text)
+            self.send_display_osd()
+            self.reset_send_uid()
+        secs = self._hold_seconds(item, decaseconds_option)
+        if secs < 0:
+            return
+        gevent.sleep(secs)
+        with self._queue_lock:
+            self.set_send_uid(uid)
+            self._clear_rows(row, rows)
+            self.send_display_osd()
+            self.reset_send_uid()
+
     def send_msp(self, msp: MSPPacket) -> None:
         """
         Sends a MSP packet to the backpack connection
@@ -427,25 +591,22 @@ class ELRSBackpack(VRxController):
         :param args: _description_
         """
         pilot_id = args["pilot_id"]
+        self._osd_layouts.pop(pilot_id, None)
         uid = self.get_pilot_uid(pilot_id)
         uid_formated = ".".join([str(int.from_bytes((byte,))) for byte in uid])
         logger.info("Pilot %s's UID set to %s", pilot_id, uid_formated)
+        self._pilot_layout(pilot_id)
 
     def onRaceStage(self, args) -> None:
-        """
-        _summary_
-
-        :param args: _description_
-        """
         if not self._backpack_connected:
             return
+        self._preload_layouts()
 
         use_heat_name = self._rhapi.db.option("_heat_name") == "1"
         use_round_num = self._rhapi.db.option("_round_num") == "1"
         use_class_name = self._rhapi.db.option("_class_name") == "1"
         use_event_name = self._rhapi.db.option("_event_name") == "1"
 
-        # Pull heat name and rounds
         heat_data = self._rhapi.db.heat_by_id(args["heat_id"])
         if heat_data:
             class_id = heat_data.class_id
@@ -456,158 +617,126 @@ class ELRSBackpack(VRxController):
             heat_name = None
             round_num = None
 
-        # Check class name
         if class_id:
             raceclass = self._rhapi.db.raceclass_by_id(class_id)
             class_name = raceclass.display_name
         else:
-            raceclass = None
             class_name = None
 
-        # Generate heat message
-        heat_name_row = self._rhapi.db.option("_heatname_row")
-        if all([use_heat_name, use_round_num, heat_name, round_num]):
-            round_trans = self._rhapi.__("Round")
-            heat_message = (
-                f"x {heat_name.upper()} | {round_trans.upper()} {round_num} w"
-            )
-            heat_start_col = self.center_osd(len(heat_message))
-            heat_message_parms = (heat_name_row, heat_start_col, heat_message)
-        elif use_heat_name and heat_name:
-            heat_message = f"x {heat_name.upper()} w"
-            heat_start_col = self.center_osd(len(heat_message))
-            heat_message_parms = (heat_name_row, heat_start_col, heat_message)
-        else:
-            heat_message_parms = None
-
-        # Generate class message
-        class_name_row = self._rhapi.db.option("_classname_row")
-        if use_class_name and class_name:
-            class_message = f"x {class_name.upper()} w"
-            class_start_col = self.center_osd(len(class_message))
-            class_message_parms = (class_name_row, class_start_col, class_message)
-
-        # Generate event message
-        event_name_row = self._rhapi.db.option("_eventname_row")
         event_name = self._rhapi.db.option("eventName")
-        if use_event_name and event_name:
-            event_name = self._rhapi.db.option("eventName")
-            event_message = heat_message = f"x {event_name.upper()} w"
-            event_start_col = self.center_osd(len(heat_message))
-            event_message_parms = (event_name_row, event_start_col, event_message)
+        stage_text = self._rhapi.db.option("_racestage_message")
 
-        start_col = self.center_osd(len(self._rhapi.db.option("_racestage_message")))
-        stage_mesage = (
-            self._rhapi.db.option("_status_row"),
-            start_col,
-            self._rhapi.db.option("_racestage_message"),
-        )
+        def heat_text(include_round: bool) -> str:
+            if not heat_name:
+                return ""
+            if include_round and round_num:
+                round_trans = self._rhapi.__("Round")
+                return f"x {heat_name.upper()} | {round_trans.upper()} {round_num} w"
+            return f"x {heat_name.upper()} w"
 
-        # Send stage message to all pilots
         def arm(pilot_id):
+            layout = self._pilot_layout(pilot_id)
+            heat_item = self._item(
+                layout,
+                "heat_name",
+                fallback_on=use_heat_name and bool(heat_name),
+                row=self._opt_int("_heatname_row", 2),
+            )
+            class_item = self._item(
+                layout,
+                "class_name",
+                fallback_on=use_class_name and bool(class_name),
+                row=self._opt_int("_classname_row", 1),
+            )
+            event_item = self._item(
+                layout,
+                "event_name",
+                fallback_on=use_event_name and bool(event_name),
+                row=self._opt_int("_eventname_row", 0),
+            )
+            status_item = self._item(
+                layout,
+                "race_status",
+                fallback_on=True,
+                row=self._opt_int("_status_row", 5),
+            )
             uid = self.get_pilot_uid(pilot_id)
             with self._queue_lock:
                 self.set_send_uid(uid)
                 self.send_clear_osd()
-
-                # Send messages to backpack
-                self.send_osd_text(*stage_mesage)
-                if use_heat_name and heat_name:
-                    assert heat_message_parms is not None
-                    self.send_osd_text(*heat_message_parms)
-                if use_class_name and class_name:
-                    self.send_osd_text(*class_message_parms)
-                if use_event_name and event_name:
-                    self.send_osd_text(*event_message_parms)
-
+                self._send_item(status_item, stage_text, "race_status")
+                include_round = True if layout is not None else use_round_num
+                self._send_item(heat_item, heat_text(include_round), "heat_name")
+                if class_name:
+                    self._send_item(class_item, f"x {class_name.upper()} w", "class_name")
+                if event_name:
+                    self._send_item(event_item, f"x {str(event_name).upper()} w", "event_name")
                 self.send_display_osd()
                 self.reset_send_uid()
 
         seat_pilots = self._rhapi.race.pilots
         for seat in seat_pilots:
-            if (
-                seat_pilots[seat]
-                and self._rhapi.db.pilot_attribute_value(
-                    seat_pilots[seat], "elrs_active"
-                )
-                == "1"
-            ):
+            if seat_pilots[seat] and self._pilot_on(seat_pilots[seat]):
                 gevent.spawn(arm, seat_pilots[seat])
 
     def onRaceStart(self, *_) -> None:
         if not self._backpack_connected:
             return
+        self._preload_layouts()
 
         def start(pilot_id):
+            layout = self._pilot_layout(pilot_id)
+            status_item = self._item(
+                layout,
+                "race_status",
+                fallback_on=True,
+                row=self._opt_int("_status_row", 5),
+            )
             uid = self.get_pilot_uid(pilot_id)
-            start_col = self.center_osd(
-                len(self._rhapi.db.option("_racestart_message"))
-            )
-
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-
-            self.send_clear_osd()
-
-            self.send_osd_text(
-                self._rhapi.db.option("_status_row"),
-                start_col,
-                self._rhapi.db.option("_racestart_message"),
-            )
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
-
-            gevent.sleep(self._rhapi.db.option("_racestart_uptime") * 1e-1)
-
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_clear_osd_row(self._rhapi.db.option("_status_row"))
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
+            with self._queue_lock:
+                self.set_send_uid(uid)
+                self.send_clear_osd()
+                self._send_item(status_item, self._rhapi.db.option("_racestart_message"), "race_status")
+                self.send_display_osd()
+                self.reset_send_uid()
+            if not status_item:
+                return
+            secs = self._hold_seconds(status_item, "_racestart_uptime")
+            if secs < 0:
+                return
+            gevent.sleep(secs)
+            row, _ = self._coords(status_item, "x")
+            with self._queue_lock:
+                self.set_send_uid(uid)
+                self.send_clear_osd_row(row)
+                self.send_display_osd()
+                self.reset_send_uid()
 
         seat_pilots = self._rhapi.race.pilots
         for seat in seat_pilots:
-            if (
-                seat_pilots[seat]
-                and self._rhapi.db.pilot_attribute_value(
-                    seat_pilots[seat], "elrs_active"
-                )
-                == "1"
-            ):
+            if seat_pilots[seat] and self._pilot_on(seat_pilots[seat]):
                 gevent.spawn(start, seat_pilots[seat])
 
     def onRaceFinish(self, *_) -> None:
         if not self._backpack_connected:
             return
+        self._preload_layouts()
 
         def finish(pilot_id):
+            layout = self._pilot_layout(pilot_id)
+            status_item = self._item(
+                layout,
+                "race_status",
+                fallback_on=True,
+                row=self._opt_int("_status_row", 5),
+            )
             uid = self.get_pilot_uid(pilot_id)
-            start_col = self.center_osd(
-                len(self._rhapi.db.option("_racefinish_message"))
-            )
-
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_clear_osd_row(self._rhapi.db.option("_status_row"))
-            self.send_osd_text(
-                self._rhapi.db.option("_status_row"),
-                start_col,
+            self._show_then_clear(
+                uid,
+                status_item,
                 self._rhapi.db.option("_racefinish_message"),
+                "_finish_uptime",
             )
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
-
-            gevent.sleep(self._rhapi.db.option("_finish_uptime") * 1e-1)
-
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_clear_osd_row(self._rhapi.db.option("_status_row"))
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
 
         seat_pilots = self._rhapi.race.pilots
         seats_finished = self._rhapi.race.seats_finished
@@ -615,32 +744,31 @@ class ELRSBackpack(VRxController):
         for seat in seat_pilots:
             if (
                 seat_pilots[seat]
-                and self._rhapi.db.pilot_attribute_value(
-                    seat_pilots[seat], "elrs_active"
-                )
-                == "1"
+                and self._pilot_on(seat_pilots[seat])
+                and not seats_finished[seat]
             ):
-                if not seats_finished[seat]:
-                    gevent.spawn(finish, seat_pilots[seat])
+                gevent.spawn(finish, seat_pilots[seat])
 
     def onRaceStop(self, *_) -> None:
         if not self._backpack_connected:
             return
+        self._preload_layouts()
 
         def land(pilot_id):
-            uid = self.get_pilot_uid(pilot_id)
-            start_col = self.center_osd(len(self._rhapi.db.option("_racestop_message")))
-
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_osd_text(
-                self._rhapi.db.option("_status_row"),
-                start_col,
-                self._rhapi.db.option("_racestop_message"),
+            layout = self._pilot_layout(pilot_id)
+            status_item = self._item(
+                layout,
+                "race_status",
+                fallback_on=True,
+                row=self._opt_int("_status_row", 5),
             )
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
+            uid = self.get_pilot_uid(pilot_id)
+            self._show_then_clear(
+                uid,
+                status_item,
+                self._rhapi.db.option("_racestop_message"),
+                "_finish_uptime",
+            )
 
         seat_pilots = self._rhapi.race.pilots
         seats_finished = self._rhapi.race.seats_finished
@@ -648,133 +776,227 @@ class ELRSBackpack(VRxController):
         for seat in seat_pilots:
             if (
                 seat_pilots[seat]
-                and self._rhapi.db.pilot_attribute_value(
-                    seat_pilots[seat], "elrs_active"
-                )
-                == "1"
+                and self._pilot_on(seat_pilots[seat])
+                and not seats_finished[seat]
             ):
-                if not seats_finished[seat]:
-                    gevent.spawn(land, seat_pilots[seat])
+                gevent.spawn(land, seat_pilots[seat])
+
+    def _lap_time_message(self, gap_info) -> str:
+        if gap_info.race.win_condition == WinCondition.FASTEST_CONSECUTIVE:
+            formatted_time1 = self._rhapi.utils.format_split_time_to_str(
+                gap_info.current.last_lap_time, "{m}:{s}.{d}"
+            )
+            formatted_time2 = self._rhapi.utils.format_split_time_to_str(
+                gap_info.current.consecutives, "{m}:{s}.{d}"
+            )
+            return f"x {formatted_time1} | {gap_info.current.consecutives_base}/{formatted_time2} w"
+        if gap_info.race.win_condition == WinCondition.FASTEST_LAP and getattr(
+            gap_info.current, "is_best", gap_info.current.is_best_lap
+        ):
+            formatted_time = self._rhapi.utils.format_split_time_to_str(
+                gap_info.current.last_lap_time, "{m}:{s}.{d}"
+            )
+            return f"x BEST LAP | {formatted_time} w"
+        formatted_time1 = self._rhapi.utils.format_split_time_to_str(
+            gap_info.current.last_lap_time, "{m}:{s}.{d}"
+        )
+        formatted_time2 = self._rhapi.utils.format_split_time_to_str(
+            gap_info.current.total_time_laps, "{m}:{s}.{d}"
+        )
+        return f"x {formatted_time1} | {formatted_time2} w"
+
+    def _gap_ahead_message(self, gap_info) -> str:
+        if gap_info.race.win_condition == WinCondition.FASTEST_CONSECUTIVE:
+            formatted_time1 = self._rhapi.utils.format_split_time_to_str(
+                gap_info.current.last_lap_time, "{m}:{s}.{d}"
+            )
+            formatted_time2 = self._rhapi.utils.format_split_time_to_str(
+                gap_info.current.consecutives, "{m}:{s}.{d}"
+            )
+            return f"x {formatted_time1} | {gap_info.current.consecutives_base}/{formatted_time2} w"
+        if gap_info.race.win_condition == WinCondition.FASTEST_LAP:
+            if gap_info.next_rank.diff_time:
+                formatted_time = self._rhapi.utils.format_split_time_to_str(
+                    gap_info.next_rank.diff_time, "{m}:{s}.{d}"
+                )
+                return f"x {str.upper(gap_info.next_rank.callsign)} | +{formatted_time} w"
+            if gap_info.current.is_best_lap and gap_info.current.lap_number:
+                formatted_time = self._rhapi.utils.format_split_time_to_str(
+                    gap_info.current.last_lap_time, "{m}:{s}.{d}"
+                )
+                return f"x {self._rhapi.db.option('_leader_message')} | {formatted_time} w"
+            if gap_info.current.lap_number:
+                formatted_time = self._rhapi.utils.format_split_time_to_str(
+                    gap_info.first_rank.diff_time, "{m}:{s}.{d}"
+                )
+                return f"x {str.upper(gap_info.first_rank.callsign)} | +{formatted_time} w"
+            return ""
+        if gap_info.next_rank.diff_time:
+            formatted_time = self._rhapi.utils.format_split_time_to_str(
+                gap_info.next_rank.diff_time, "{m}:{s}.{d}"
+            )
+            return f"x {str.upper(gap_info.next_rank.callsign)} | +{formatted_time} w"
+        if gap_info.current.lap_number:
+            formatted_time = self._rhapi.utils.format_split_time_to_str(
+                gap_info.current.last_lap_time, "{m}:{s}.{d}"
+            )
+            return f"x {self._rhapi.db.option('_leader_message')} | {formatted_time} w"
+        return ""
+
+    def _gap_behind_message(self, result: dict, leaderboard: list) -> str:
+        try:
+            pos = int(result.get("position"))
+        except (TypeError, ValueError):
+            return ""
+        behind = None
+        for other in leaderboard or []:
+            try:
+                if int(other.get("position")) == pos + 1:
+                    behind = other
+                    break
+            except (TypeError, ValueError):
+                continue
+        if not behind:
+            return ""
+        callsign = str(behind.get("callsign") or "").upper()
+        formatted = ""
+        try:
+            cur = result.get("total_time_raw")
+            oth = behind.get("total_time_raw")
+            if cur and oth:
+                formatted = self._rhapi.utils.format_split_time_to_str(
+                    abs(int(oth) - int(cur)), "{m}:{s}.{d}"
+                )
+        except (TypeError, ValueError):
+            formatted = ""
+        if formatted:
+            return f"x {callsign} | -{formatted} w"
+        return f"x {callsign} w"
+
+    def _position_message(self, result: dict, layout: dict | None) -> str:
+        laps = int(result.get("laps") or 0) + 1
+        if layout is not None or self._rhapi.db.option("_position_mode") == "1":
+            return f"POSN: {str(result.get('position')).upper()} | LAP: {laps}"
+        return f"LAP: {laps}"
+
+    def _recent_lap_lines(self, gap_info, count: int) -> list[str]:
+        node = getattr(getattr(gap_info, "current", None), "lap_list", None)
+        laps = []
+        if isinstance(node, dict):
+            laps = node.get("laps") or []
+        elif isinstance(node, list):
+            laps = node
+        lines = []
+        for lap in laps:
+            if not isinstance(lap, dict) or lap.get("deleted"):
+                continue
+            num = lap.get("lap_number")
+            time_s = self._short_time(lap.get("lap_time_formatted") or lap.get("lap_time"))
+            if num in (0, None) and not lines:
+                label = "HS"
+            elif num in (0, -1) or num is None:
+                label = "HS" if not lines else f"L{len(lines)}"
+            else:
+                label = f"L{num}"
+            lines.append(f"{label} {time_s}".strip())
+        return lines[-max(1, count) :]
 
     def onRaceLapRecorded(self, args: dict) -> None:
         if not self._backpack_connected:
             return
+        self._preload_layouts()
 
         def update_pos(result):
             pilot_id = result["pilot_id"]
-
-            if self._rhapi.db.option("_position_mode") != "1":
-                message = f"LAP: {result['laps'] + 1}"
-            else:
-                message = f"POSN: {str(result['position']).upper()} | LAP: {result['laps'] + 1}"
-            start_col = self.center_osd(len(message))
-
-            uid = self.get_pilot_uid(pilot_id)
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_clear_osd_row(self._rhapi.db.option("_currentlap_row"))
-
-            self.send_osd_text(
-                self._rhapi.db.option("_currentlap_row"), start_col, message
+            layout = self._pilot_layout(pilot_id)
+            item = self._item(
+                layout,
+                "lap_position",
+                fallback_on=True,
+                row=self._opt_int("_currentlap_row", 0),
             )
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
+            if not item:
+                return
+            message = self._position_message(result, layout)
+            uid = self.get_pilot_uid(pilot_id)
+            row, col = self._coords(item, message)
+            with self._queue_lock:
+                self.set_send_uid(uid)
+                self.send_clear_osd_row(row)
+                self.send_osd_text(row, col, message)
+                self.send_display_osd()
+                self.reset_send_uid()
+
+        def update_recent(result, gap_info):
+            if gap_info is None:
+                return
+            pilot_id = result["pilot_id"]
+            layout = self._pilot_layout(pilot_id)
+            item = self._item(layout, "recent_laps", fallback_on=False)
+            if not item:
+                return
+            count = max(1, min(5, int(item.get("num_laps") or 3)))
+            lines = self._recent_lap_lines(gap_info, count)
+            if not lines:
+                return
+            uid = self.get_pilot_uid(pilot_id)
+            start_row = max(0, min(17, int(item.get("row") or 0)))
+            with self._queue_lock:
+                self.set_send_uid(uid)
+                self._clear_rows(start_row, count)
+                for offset, line in enumerate(lines):
+                    row = min(17, start_row + offset)
+                    col = (
+                        self.center_osd(len(line))
+                        if item.get("center", True)
+                        else max(0, min(49, int(item.get("col") or 0)))
+                    )
+                    self.send_osd_text(row, col, line)
+                self.send_display_osd()
+                self.reset_send_uid()
 
         def lap_results(result, gap_info):
             pilot_id = result["pilot_id"]
-
-            message = ""
-            if self._rhapi.db.option("_gap_mode") != "1":
-                if gap_info.race.win_condition == WinCondition.FASTEST_CONSECUTIVE:
-                    formatted_time1 = self._rhapi.utils.format_split_time_to_str(
-                        gap_info.current.last_lap_time, "{m}:{s}.{d}"
-                    )
-                    formatted_time2 = self._rhapi.utils.format_split_time_to_str(
-                        gap_info.current.consecutives, "{m}:{s}.{d}"
-                    )
-                    message = f"x {formatted_time1} | {gap_info.current.consecutives_base}/{formatted_time2} w"
-                elif (
-                    gap_info.race.win_condition == WinCondition.FASTEST_LAP
-                    and gap_info.current.is_best
-                ):
-                    formatted_time = self._rhapi.utils.format_split_time_to_str(
-                        gap_info.current.last_lap_time, "{m}:{s}.{d}"
-                    )
-                    message = f"x BEST LAP | {formatted_time} w"
-                else:
-                    formatted_time1 = self._rhapi.utils.format_split_time_to_str(
-                        gap_info.current.last_lap_time, "{m}:{s}.{d}"
-                    )
-                    formatted_time2 = self._rhapi.utils.format_split_time_to_str(
-                        gap_info.current.total_time_laps, "{m}:{s}.{d}"
-                    )
-                    message = f"x {formatted_time1} | {formatted_time2} w"
-
-            elif gap_info.race.win_condition == WinCondition.FASTEST_CONSECUTIVE:
-                formatted_time1 = self._rhapi.utils.format_split_time_to_str(
-                    gap_info.current.last_lap_time, "{m}:{s}.{d}"
-                )
-                formatted_time2 = self._rhapi.utils.format_split_time_to_str(
-                    gap_info.current.consecutives, "{m}:{s}.{d}"
-                )
-                message = f"x {formatted_time1} | {gap_info.current.consecutives_base}/{formatted_time2} w"
-
-            elif gap_info.race.win_condition == WinCondition.FASTEST_LAP:
-                if gap_info.next_rank.diff_time:
-                    formatted_time = self._rhapi.utils.format_split_time_to_str(
-                        gap_info.next_rank.diff_time, "{m}:{s}.{d}"
-                    )
-                    formatted_callsign = str.upper(gap_info.next_rank.callsign)
-                    message = f"x {formatted_callsign} | +{formatted_time} w"
-
-                elif gap_info.current.is_best_lap and gap_info.current.lap_number:
-                    formatted_time = self._rhapi.utils.format_split_time_to_str(
-                        gap_info.current.last_lap_time, "{m}:{s}.{d}"
-                    )
-                    message = f"x {self._rhapi.db.option('_leader_message')} | {formatted_time} w"
-
-                elif gap_info.current.lap_number:
-                    formatted_time = self._rhapi.utils.format_split_time_to_str(
-                        gap_info.first_rank.diff_time, "{m}:{s}.{d}"
-                    )
-                    formatted_callsign = str.upper(gap_info.first_rank.callsign)
-                    message = f"x {formatted_callsign} | +{formatted_time} w"
-
-            else:
-                if gap_info.next_rank.diff_time:
-                    formatted_time = self._rhapi.utils.format_split_time_to_str(
-                        gap_info.next_rank.diff_time, "{m}:{s}.{d}"
-                    )
-                    formatted_callsign = str.upper(gap_info.next_rank.callsign)
-                    message = f"x {formatted_callsign} | +{formatted_time} w"
-
-                elif gap_info.current.lap_number:
-                    formatted_time = self._rhapi.utils.format_split_time_to_str(
-                        gap_info.current.last_lap_time, "{m}:{s}.{d}"
-                    )
-                    message = f"x {self._rhapi.db.option('_leader_message')} | {formatted_time} w"
-
-            start_col = self.center_osd(len(message))
-
-            uid = self.get_pilot_uid(pilot_id)
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_osd_text(
-                self._rhapi.db.option("_lapresults_row"), start_col, message
+            layout = self._pilot_layout(pilot_id)
+            gap_on = self._rhapi.db.option("_gap_mode") == "1"
+            lap_item = self._item(
+                layout,
+                "lap_result",
+                fallback_on=not gap_on,
+                row=self._opt_int("_lapresults_row", 15),
             )
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
-
-            gevent.sleep(self._rhapi.db.option("_results_uptime") * 1e-1)
-
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_clear_osd_row(self._rhapi.db.option("_lapresults_row"))
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
+            gap_item = self._item(
+                layout,
+                "gap_result",
+                fallback_on=gap_on,
+                row=self._opt_int("_lapresults_row", 15),
+            )
+            behind_item = self._item(layout, "gap_behind", fallback_on=False)
+            uid = self.get_pilot_uid(pilot_id)
+            if lap_item:
+                gevent.spawn(
+                    self._show_then_clear,
+                    uid,
+                    lap_item,
+                    self._lap_time_message(gap_info),
+                    "_results_uptime",
+                )
+            if gap_item:
+                gevent.spawn(
+                    self._show_then_clear,
+                    uid,
+                    gap_item,
+                    self._gap_ahead_message(gap_info),
+                    "_results_uptime",
+                )
+            if behind_item:
+                gevent.spawn(
+                    self._show_then_clear,
+                    uid,
+                    behind_item,
+                    self._gap_behind_message(result, args["results"].get("by_race_time") or []),
+                    "_results_uptime",
+                )
 
         seats_finished = self._rhapi.race.seats_finished
         pilots_completion = {}
@@ -784,14 +1006,11 @@ class ELRSBackpack(VRxController):
 
         results = args["results"]["by_race_time"]
         for result in results:
-            if (
-                self._rhapi.db.pilot_attribute_value(result["pilot_id"], "elrs_active")
-                == "1"
-            ):
-                if not pilots_completion[result["pilot_id"]]:
-                    gevent.spawn(update_pos, result)
-
-                    if result["pilot_id"] == args["pilot_id"] and (result["laps"] > 0):
+            if self._pilot_on(result["pilot_id"]) and not pilots_completion[result["pilot_id"]]:
+                gevent.spawn(update_pos, result)
+                if result["pilot_id"] == args["pilot_id"]:
+                    gevent.spawn(update_recent, result, args.get("gap_info"))
+                    if result["laps"] > 0:
                         gevent.spawn(lap_results, result, args["gap_info"])
 
     def onLapDelete(self, *_) -> None:
@@ -810,17 +1029,19 @@ class ELRSBackpack(VRxController):
             self.reset_send_uid()
             self._queue_lock.release()
 
-        if self._rhapi.db.option("_results_mode") == "1":
-            seat_pilots = self._rhapi.race.pilots
-            for seat in seat_pilots:
-                if (
-                    seat_pilots[seat]
-                    and self._rhapi.db.pilot_attribute_value(
-                        seat_pilots[seat], "elrs_active"
-                    )
-                    == "1"
-                ):
-                    gevent.spawn(delete, seat_pilots[seat])
+        seat_pilots = self._rhapi.race.pilots
+        for seat in seat_pilots:
+            if not seat_pilots[seat] or not self._pilot_on(seat_pilots[seat]):
+                continue
+            layout = self._pilot_layout(seat_pilots[seat])
+            results_item = self._item(
+                layout,
+                "results",
+                fallback_on=self._rhapi.db.option("_results_mode") == "1",
+                row=self._opt_int("_results_row", 13),
+            )
+            if results_item:
+                gevent.spawn(delete, seat_pilots[seat])
 
     def onRacePilotDone(self, args: dict) -> None:
         """
@@ -828,63 +1049,66 @@ class ELRSBackpack(VRxController):
         """
         if not self._backpack_connected:
             return
+        self._preload_layouts()
 
         def done(result, win_condition):
             pilot_id = result["pilot_id"]
-            start_col = self.center_osd(
-                len(self._rhapi.db.option("_pilotdone_message"))
+            layout = self._pilot_layout(pilot_id)
+            status_item = self._item(
+                layout,
+                "race_status",
+                fallback_on=True,
+                row=self._opt_int("_status_row", 5),
             )
-            results_row1 = self._rhapi.db.option("_results_row")
-            results_row2 = results_row1 + 1
-
+            pos_item = self._item(
+                layout,
+                "lap_position",
+                fallback_on=True,
+                row=self._opt_int("_currentlap_row", 0),
+            )
+            results_item = self._item(
+                layout,
+                "results",
+                fallback_on=self._rhapi.db.option("_results_mode") == "1",
+                row=self._opt_int("_results_row", 13),
+            )
             uid = self.get_pilot_uid(pilot_id)
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_clear_osd_row(self._rhapi.db.option("_currentlap_row"))
-            self.send_clear_osd_row(self._rhapi.db.option("_status_row"))
-            self.send_osd_text(
-                self._rhapi.db.option("_status_row"),
-                start_col,
-                self._rhapi.db.option("_pilotdone_message"),
-            )
+            with self._queue_lock:
+                self.set_send_uid(uid)
+                if pos_item:
+                    self.send_clear_osd_row(int(pos_item.get("row") or 0))
+                self._send_item(status_item, self._rhapi.db.option("_pilotdone_message"), "race_status")
+                if results_item:
+                    placement_message = f"PLACEMENT: {result['position']}"
+                    self._send_item(results_item, placement_message, "results")
+                    if win_condition == WinCondition.FASTEST_CONSECUTIVE:
+                        win_message = f"FASTEST {result['consecutives_base']} CONSEC: {result['consecutives']}"
+                    elif win_condition == WinCondition.FASTEST_LAP:
+                        win_message = f"FASTEST LAP: {result['fastest_lap']}"
+                    elif win_condition == WinCondition.FIRST_TO_LAP_X:
+                        win_message = f"TOTAL TIME: {result['total_time']}"
+                    else:
+                        win_message = f"LAPS COMPLETED: {result['laps']}"
+                    win_item = dict(results_item)
+                    win_item["row"] = min(17, int(results_item.get("row") or 0) + 1)
+                    self._send_item(win_item, win_message, "results")
+                self.send_display_osd()
+                self.reset_send_uid()
 
-            if self._rhapi.db.option("_results_mode") == "1":
-                placement_message = f"PLACEMENT: {result['position']}"
-                place_col = self.center_osd(len(placement_message))
-                self.send_osd_text(results_row1, place_col, placement_message)
-
-                if win_condition == WinCondition.FASTEST_CONSECUTIVE:
-                    win_message = f"FASTEST {result['consecutives_base']} CONSEC: {result['consecutives']}"
-                elif win_condition == WinCondition.FASTEST_LAP:
-                    win_message = f"FASTEST LAP: {result['fastest_lap']}"
-                elif win_condition == WinCondition.FIRST_TO_LAP_X:
-                    win_message = f"TOTAL TIME: {result['total_time']}"
-                else:
-                    win_message = f"LAPS COMPLETED: {result['laps']}"
-
-                win_col = self.center_osd(len(win_message))
-                self.send_osd_text(results_row2, win_col, win_message)
-
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
-
-            gevent.sleep(self._rhapi.db.option("_finish_uptime") * 1e-1)
-
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_clear_osd_row(self._rhapi.db.option("_status_row"))
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
+            secs = self._hold_seconds(status_item, "_finish_uptime")
+            if status_item and secs >= 0:
+                gevent.sleep(secs)
+                row, _ = self._coords(status_item, "x")
+                with self._queue_lock:
+                    self.set_send_uid(uid)
+                    self.send_clear_osd_row(row)
+                    self.send_display_osd()
+                    self.reset_send_uid()
 
         results = args["results"]
         leaderboard = results[results["meta"]["primary_leaderboard"]]
         for result in leaderboard:
-            if (
-                self._rhapi.db.pilot_attribute_value(args["pilot_id"], "elrs_active")
-                == "1"
-            ) and (result["pilot_id"] == args["pilot_id"]):
+            if self._pilot_on(args["pilot_id"]) and result["pilot_id"] == args["pilot_id"]:
                 gevent.spawn(done, result, results["meta"]["win_condition"])
                 break
 
@@ -906,13 +1130,7 @@ class ELRSBackpack(VRxController):
 
         seat_pilots = self._rhapi.race.pilots
         for seat in seat_pilots:
-            if (
-                seat_pilots[seat]
-                and self._rhapi.db.pilot_attribute_value(
-                    seat_pilots[seat], "elrs_active"
-                )
-                == "1"
-            ):
+            if seat_pilots[seat] and self._pilot_on(seat_pilots[seat]):
                 gevent.spawn(clear, seat_pilots[seat])
 
     def onSendMessage(self, args: dict | None = None) -> None:
@@ -924,37 +1142,25 @@ class ELRSBackpack(VRxController):
 
         if args is None:
             return
+        self._preload_layouts()
 
         def notify(pilot):
-            uid = self.get_pilot_uid(pilot)
-            start_col = self.center_osd(len(args["message"]))
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_osd_text(
-                self._rhapi.db.option("_announcement_row"),
-                start_col,
-                f"x {str.upper(args['message'])} w",
+            layout = self._pilot_layout(pilot)
+            item = self._item(
+                layout,
+                "announcement",
+                fallback_on=True,
+                row=self._opt_int("_announcement_row", 3),
             )
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
-
-            gevent.sleep(self._rhapi.db.option("_announcement_uptime") * 1e-1)
-
-            self._queue_lock.acquire()
-            self.set_send_uid(uid)
-            self.send_clear_osd_row(self._rhapi.db.option("_announcement_row"))
-            self.send_display_osd()
-            self.reset_send_uid()
-            self._queue_lock.release()
+            uid = self.get_pilot_uid(pilot)
+            self._show_then_clear(
+                uid,
+                item,
+                f"x {str.upper(args['message'])} w",
+                "_announcement_uptime",
+            )
 
         seat_pilots = self._rhapi.race.pilots
         for seat in seat_pilots:
-            if (
-                seat_pilots[seat]
-                and self._rhapi.db.pilot_attribute_value(
-                    seat_pilots[seat], "elrs_active"
-                )
-                == "1"
-            ):
+            if seat_pilots[seat] and self._pilot_on(seat_pilots[seat]):
                 gevent.spawn(notify, seat_pilots[seat])

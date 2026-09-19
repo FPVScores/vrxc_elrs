@@ -188,6 +188,10 @@ The pilot's individual bind phrase for their backpack. If a bind phrase is not s
 
 Turns the pilot's ELRS OSD on/off
 
+### Goggle OSD layout
+
+Imported from FPV Scores Race OSD. When a layout is present, that pilot's own items, rows, columns and durations are used. Timer-wide OSD Settings stay as the fallback for pilots without a saved layout, and still supply the wording (ARM NOW, GO, and so on).
+
 ## ELRS Backpack General Settings
 
 ![General Settings](docs/general_settings.png)
@@ -232,8 +236,7 @@ Starts the backpack's WIFI mode. Used for over-the-air firmware updates.
 ![OSD Settings](docs/osd_settings.png)
 
 > [!NOTE]
-> It is a goal of this project to eventually move all the OSD settings in this section to be pilot configurable through the ExpressLRS VRx backpack's web user interface.
-> The current implementation is noted to be a work around until enough progress has been completed on the VRx backpack for individual pilot configuration.
+> Pilots who saved a Race OSD layout on FPV Scores (and were imported onto the timer) use that layout for which items appear, where they sit, and how long they stay. The settings below remain the fallback for pilots without a layout, and they still set the message wording.
 
 ### Show Heat Name : CHECKBOX
 

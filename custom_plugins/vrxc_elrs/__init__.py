@@ -33,6 +33,20 @@ def initialize(rhapi: RHAPI.RHAPI):
     active = UIField("elrs_active", "Enable ELRS OSD", field_type=UIFieldType.CHECKBOX)
     rhapi.fields.register_pilot_attribute(active)
 
+    try:
+        rhapi.fields.register_pilot_attribute(
+            UIField(
+                "comm_osd",
+                "Goggle OSD layout",
+                UIFieldType.TEXT,
+                private=True,
+            )
+        )
+    except TypeError:
+        rhapi.fields.register_pilot_attribute(
+            UIField("comm_osd", "Goggle OSD layout", field_type=UIFieldType.TEXT)
+        )
+
     rhapi.ui.register_panel(
         "elrs_settings", "ELRS Backpack General Settings", "settings", order=0
     )
